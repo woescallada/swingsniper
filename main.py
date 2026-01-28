@@ -3,194 +3,217 @@ import yfinance as yf
 import pandas as pd
 import ta
 import time
+import requests
 from datetime import datetime
 
 # --- CONFIGURACIÓN VISUAL ---
-st.set_page_config(page_title="Penny Stock Sniper Color", layout="wide", page_icon="🚦")
+st.set_page_config(page_title="Penny Stock Sniper Guru", layout="wide", page_icon="🦈")
 
-# CSS para que los colores resalten más en modo oscuro/claro
+# CSS para forzar colores oscuros/claros legibles y tablas grandes
 st.markdown("""
     <style>
     .stDataFrame { font-size: 1.1rem; }
+    div[data-testid="stMetricValue"] { font-size: 1.8rem; }
     </style>
 """, unsafe_allow_html=True)
 
 if 'watchlist' not in st.session_state:
     st.session_state.watchlist = []
 
-# --- MOTOR DE DATOS (IGUAL QUE LA VERSIÓN GURU) ---
+# --- MOTOR DE DATOS (CON BYPASS ANTI-BOT) ---
 
 @st.cache_data(ttl=600)
 def get_raw_candidates():
+    """Obtiene tickers simulando ser un navegador real para evitar bloqueo 403"""
     try:
         url = "https://finance.yahoo.com/gainers"
-        tables = pd.read_html(url)
+        
+        # DISFRAZ: Headers de Chrome
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers)
+        
+        # Si falla la petición HTTP
+        if response.status_code != 200:
+            st.warning(f"Yahoo respondió con código {response.status_code}. Usando lista de emergencia.")
+            return ["MULN", "GME", "AMC", "MARA", "RIOT", "SOFI", "PLTR", "NVDA", "AMD", "TSLA"]
+            
+        tables = pd.read_html(response.text)
         return tables[0]['Symbol'].tolist()
-    except:
-        return []
+        
+    except Exception as e:
+        st.error(f"Error de conexión: {e}. Usando lista de respaldo.")
+        return ["MULN", "GME", "AMC", "MARA", "RIOT", "SOFI", "PLTR", "NVDA", "AMD", "TSLA"]
 
 def get_guru_analysis(ticker):
+    """Análisis Técnico + Fundamental (Float)"""
     try:
         t = yf.Ticker(ticker)
+        # Info fundamental (Float)
         info = t.info
         
-        # Filtro de precio básico
+        # Filtro de precio básico (Evitar errores si no hay precio)
         price = info.get('currentPrice', 0)
         if price == 0: 
-            hist = t.history(period='1d')
-            if not hist.empty: price = hist['Close'].iloc[-1]
+            hist_now = t.history(period='1d')
+            if not hist_now.empty: price = hist_now['Close'].iloc[-1]
             else: return None
                 
-        # Datos Históricos
+        # Descargar historial para técnico (6 meses)
         df = t.history(period="6mo", interval="1d")
         if len(df) < 50: return None
         
-        # Variables
+        # --- VARIABLES CLAVE ---
         float_shares = info.get('floatShares', None)
         market_cap = info.get('marketCap', 0)
         
+        # Estimación de Float si Yahoo devuelve None
         if float_shares is None and price > 0:
             float_shares = market_cap / price 
             
         current_volume = df['Volume'].iloc[-1]
         avg_volume = df['Volume'].rolling(20).mean().iloc[-1]
         
-        # Indicadores
+        # --- INDICADORES ---
         sma20 = df['Close'].rolling(20).mean().iloc[-1]
         sma50 = df['Close'].rolling(50).mean().iloc[-1]
         sma200 = df['Close'].rolling(200).mean().iloc[-1] if len(df) > 200 else 0
         rsi = ta.momentum.rsi(df['Close'], window=14).iloc[-1]
         atr = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14).iloc[-1]
         
-        # Posición de cierre
+        # Posición de cierre (0 a 1)
         day_range = df['High'].iloc[-1] - df['Low'].iloc[-1]
         close_pos = (df['Close'].iloc[-1] - df['Low'].iloc[-1]) / day_range if day_range > 0 else 0
         
-        # --- SCORING ---
+        # --- SISTEMA DE PUNTUACIÓN (GURU SCORE) ---
         score = 0
         
-        # 1. Supply Shock
+        # 1. Supply Shock (Escasez)
         if float_shares and float_shares < 10_000_000: score += 25
         elif float_shares and float_shares < 20_000_000: score += 15
             
-        # 2. Volume Blast
-        if float_shares and current_volume > float_shares: score += 25 # Rotación total
+        # 2. Volume Blast (Demanda Extrema)
+        if float_shares and current_volume > float_shares: score += 25 
             
-        # 3. RVOL
+        # 3. RVOL (Momentum)
         rvol = current_volume / avg_volume if avg_volume > 0 else 0
         if rvol > 5.0: score += 20
         elif rvol > 3.0: score += 10
         
-        # 4. Tendencia
+        # 4. Estructura de Tendencia
         if price > sma20 and price > sma50: score += 10
         if price > sma200: score += 5
         
-        # 5. Cierre Fuerte
+        # 5. Cierre Fuerte (Para Swing)
         if close_pos > 0.75: score += 15
             
         return {
             "Ticker": ticker,
             "Precio": price,
-            "Score": int(score), # Entero para facilitar colores
+            "Score": int(score),
             "Float (M)": float_shares / 1_000_000 if float_shares else 0,
             "RVOL": rvol,
             "RSI": rsi,
             "Cierre %": close_pos * 100,
             "ATR": atr,
-            "Stop Loss": max(price - (2.5 * atr), 0.01) # Evitar stop negativo
+            "Stop Loss": max(price - (2.5 * atr), 0.01) # Stop técnico amplio
         }
 
     except:
         return None
 
-# --- SIDEBAR ---
-st.sidebar.title("🚦 Filtros Visuales")
-min_score = st.sidebar.slider("Filtrar Basura (Score Min)", 0, 100, 60)
-st.sidebar.info("Este panel usa colores para priorizar tu atención.")
+# --- SIDEBAR (PANEL LATERAL) ---
+st.sidebar.title("🦈 Filtros Guru")
+st.sidebar.markdown("**Configuración de Escáner**")
 
-# --- LÓGICA DE COLORES (LA CLAVE) ---
-def highlight_rows(val):
-    """Pinta el fondo del Score según calidad"""
-    if val >= 85:
-        return 'background-color: #00ff00; color: black; font-weight: bold' # VERDE FLÚOR
-    elif val >= 70:
-        return 'background-color: #90ee90; color: black' # VERDE CLARO
-    elif val >= 50:
-        return 'background-color: #ffff00; color: black' # AMARILLO
-    else:
-        return 'background-color: #ffcccb; color: black' # ROJO CLARO
+min_price = st.sidebar.number_input("Precio Mín ($)", value=0.5)
+max_price = st.sidebar.number_input("Precio Máx ($)", value=25.0)
+min_score = st.sidebar.slider("Score Calidad Mínimo", 0, 100, 60, help="Menos de 60 suele ser ruido.")
+
+st.sidebar.markdown("---")
+st.sidebar.info("💡 **Semáforo:**\n\n🟢 **Verde:** Compra Fuerte\n🟣 **Texto Morado:** Float < 10M (Explosivo)")
+
+# --- ESTILOS DE COLOR (FUNCIONES PANDAS) ---
+def highlight_score(val):
+    if val >= 80: return 'background-color: #00ff00; color: black; font-weight: bold' # Verde Fósforo
+    elif val >= 60: return 'background-color: #ffff00; color: black' # Amarillo
+    return 'background-color: #ffcccc; color: black' # Rojo claro
 
 def highlight_float(val):
-    """Resalta floats peligrosamente bajos"""
-    if val < 5:
-        return 'color: #800080; font-weight: bold' # MORADO (Micro Float)
-    elif val < 15:
-        return 'color: #0000ff; font-weight: bold' # AZUL (Low Float)
+    if val < 5: return 'color: #800080; font-weight: bold' # Morado oscuro
+    if val < 15: return 'color: #0000ff; font-weight: bold' # Azul fuerte
     return ''
 
 def highlight_rvol(val):
-    """Resalta volumen masivo"""
-    if val > 5:
-        return 'color: green; font-weight: bold'
+    if val > 5: return 'color: #006400; font-weight: bold' # Verde oscuro
     return ''
 
-# --- UI PRINCIPAL ---
-st.title("🚦 Scanner Visual de Penny Stocks")
-st.write("Objetivo: Busca las filas **VERDES** con Floats **MORADOS**.")
+# --- INTERFAZ PRINCIPAL ---
+st.title("🚦 Supply Shock Scanner")
+st.write("Detectando desequilibrios de Oferta y Demanda en tiempo real.")
 
-if st.button("🔎 ESCANEAR MERCADO", type="primary"):
+if st.button("🔎 EJECUTAR ANÁLISIS", type="primary"):
     
-    with st.spinner("Analizando Oferta y Demanda..."):
+    with st.spinner("Bypassing Yahoo Security & Analizando Floats..."):
         candidates = get_raw_candidates()
         
-        if not candidates:
-            st.error("Error conectando con Yahoo Finance.")
+        # Progreso
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        valid_data = []
+        
+        for i, ticker in enumerate(candidates):
+            progress_bar.progress((i + 1) / len(candidates))
+            status_text.text(f"Analizando estructura de: {ticker}")
+            
+            data = get_guru_analysis(ticker)
+            
+            if data:
+                # FILTROS USUARIO
+                if min_price <= data['Precio'] <= max_price:
+                    if data['Score'] >= min_score:
+                        # Calcular Riesgo Visual
+                        riesgo = ((data['Precio'] - data['Stop Loss']) / data['Precio']) * 100
+                        data['Riesgo %'] = riesgo
+                        valid_data.append(data)
+        
+        progress_bar.empty()
+        status_text.empty()
+        
+        if valid_data:
+            df = pd.DataFrame(valid_data).sort_values(by="Score", ascending=False)
+            
+            st.success(f"✅ Se encontraron {len(df)} oportunidades calificadas.")
+            
+            # MOSTRAR TABLA COLOREADA
+            st.dataframe(
+                df.style
+                .applymap(highlight_score, subset=['Score'])
+                .applymap(highlight_float, subset=['Float (M)'])
+                .applymap(highlight_rvol, subset=['RVOL'])
+                .format({
+                    "Precio": "${:.2f}",
+                    "Float (M)": "{:.1f}M",
+                    "RVOL": "{:.1f}x",
+                    "RSI": "{:.0f}",
+                    "Cierre %": "{:.0f}%",
+                    "Stop Loss": "${:.2f}",
+                    "Riesgo %": "{:.1f}%"
+                }),
+                use_container_width=True,
+                height=600
+            )
+            
+            # BOTÓN DESCARGA
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "📥 Descargar CSV para Excel",
+                csv,
+                f"guru_scan_{datetime.now().strftime('%H%M')}.csv",
+                "text/csv"
+            )
         else:
-            data_list = []
-            progress = st.progress(0)
-            
-            for i, ticker in enumerate(candidates):
-                progress.progress((i+1)/len(candidates))
-                res = get_guru_analysis(ticker)
-                
-                if res and res['Score'] >= min_score:
-                    # Cálculo de riesgo visual
-                    risk_pct = ((res['Precio'] - res['Stop Loss']) / res['Precio']) * 100
-                    res['Riesgo %'] = risk_pct
-                    data_list.append(res)
-            
-            progress.empty()
-            
-            if data_list:
-                df = pd.DataFrame(data_list).sort_values(by="Score", ascending=False)
-                
-                st.success(f"✅ {len(df)} Oportunidades encontradas.")
-                
-                # --- APLICACIÓN DE ESTILOS DE COLOR ---
-                st.dataframe(
-                    df.style
-                    .applymap(highlight_rows, subset=['Score'])
-                    .applymap(highlight_float, subset=['Float (M)'])
-                    .applymap(highlight_rvol, subset=['RVOL'])
-                    .format({
-                        "Precio": "${:.2f}",
-                        "Float (M)": "{:.1f}M",
-                        "RVOL": "{:.1f}x",
-                        "RSI": "{:.0f}",
-                        "Cierre %": "{:.0f}%",
-                        "Stop Loss": "${:.2f}",
-                        "Riesgo %": "{:.1f}%"
-                    }),
-                    use_container_width=True,
-                    height=600
-                )
-                
-                # Leyenda Rápida
-                st.markdown("---")
-                c1, c2, c3 = st.columns(3)
-                c1.markdown("🟢 **Score > 85:** Compra Fuerte (Alta Probabilidad)")
-                c2.markdown("🟣 **Float < 5M:** Dinamita (Puede subir 50% hoy)")
-                c3.markdown("⚡ **RVOL > 5x:** Volumen Institucional")
-                
-            else:
-                st.warning("Ninguna acción superó el filtro de calidad.")
+            st.warning("📉 Ninguna acción superó tus filtros estrictos. El mercado hoy está débil o demasiado caro.")
