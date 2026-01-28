@@ -2,7 +2,6 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import ta
-import time
 import requests
 import json
 from datetime import datetime
@@ -21,17 +20,14 @@ st.markdown("""
 if 'watchlist' not in st.session_state:
     st.session_state.watchlist = []
 
-# --- MOTOR DE DATOS (CON BYPASS ANTI-BOT) ---
+# --- MOTOR DE DATOS (CONEXIÓN API DIRECTA) ---
 
-@st.cache_data(ttl=300) # Refrescar cada 5 minutos
+@st.cache_data(ttl=300)
 def get_raw_candidates():
-    """
-    Obtiene los Top Gainers del día conectando directamente a la API de Yahoo.
-    Esto evita el bloqueo de scraping web y trae hasta 100 resultados frescos.
-    """
+    """Obtiene Top Gainers y Activas desde la API JSON de Yahoo (Anti-Bloqueo)"""
     candidates = []
     
-    # Lista de endpoints de la API de Yahoo (Gainers y Activas)
+    # Endpoints directos de la API (sin HTML scraping)
     endpoints = [
         "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved/day_gainers?count=100&scrIds=day_gainers",
         "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved/most_actives?count=50&scrIds=most_actives"
@@ -39,57 +35,42 @@ def get_raw_candidates():
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Origin': 'https://finance.yahoo.com',
-        'Referer': 'https://finance.yahoo.com/screener/predefined/day_gainers'
+        'Origin': 'https://finance.yahoo.com'
     }
 
-    status_container = st.empty()
-    
     for url in endpoints:
         try:
-            # Petición directa a la API JSON
             response = requests.get(url, headers=headers, timeout=10)
             data = response.json()
             
-            # Navegar por el JSON de Yahoo para encontrar los símbolos
             if 'finance' in data and 'result' in data['finance']:
                 quotes = data['finance']['result'][0].get('quotes', [])
                 for quote in quotes:
                     symbol = quote.get('symbol')
-                    # Filtramos cosas raras que no sean acciones
                     if symbol and symbol.isalpha(): 
                         candidates.append(symbol)
-                        
-        except Exception as e:
-            print(f"Error conectando a API Yahoo: {e}")
+        except:
             continue
 
-    # Eliminamos duplicados
-    candidates = list(set(candidates))
-    
-    if not candidates:
-        st.error("⚠️ No se pudo conectar con el mercado en tiempo real. Revisa tu conexión.")
-        # Solo como último recurso absoluto devolvemos una lista vacía para que no analice basura
-        return []
-        
-    return candidates
+    return list(set(candidates))
 
 def get_guru_analysis(ticker):
     """Análisis Técnico + Fundamental (Float)"""
     try:
         t = yf.Ticker(ticker)
-        # Info fundamental (Float)
         info = t.info
         
-        # Filtro de precio básico (Evitar errores si no hay precio)
+        # 1. Obtener Precio Actual con seguridad
         price = info.get('currentPrice', 0)
         if price == 0: 
-            hist_now = t.history(period='1d')
-            if not hist_now.empty: price = hist_now['Close'].iloc[-1]
-            else: return None
-                
-        # Descargar historial para técnico (6 meses)
+            # Intentar backup con fast_info o history
+            try: price = t.fast_info['last_price']
+            except: 
+                hist = t.history(period='1d')
+                if not hist.empty: price = hist['Close'].iloc[-1]
+                else: return None
+        
+        # 2. Descargar Historial (6 meses)
         df = t.history(period="6mo", interval="1d")
         if len(df) < 50: return None
         
@@ -97,7 +78,6 @@ def get_guru_analysis(ticker):
         float_shares = info.get('floatShares', None)
         market_cap = info.get('marketCap', 0)
         
-        # Estimación de Float si Yahoo devuelve None
         if float_shares is None and price > 0:
             float_shares = market_cap / price 
             
@@ -111,30 +91,29 @@ def get_guru_analysis(ticker):
         rsi = ta.momentum.rsi(df['Close'], window=14).iloc[-1]
         atr = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14).iloc[-1]
         
-        # Posición de cierre (0 a 1)
         day_range = df['High'].iloc[-1] - df['Low'].iloc[-1]
         close_pos = (df['Close'].iloc[-1] - df['Low'].iloc[-1]) / day_range if day_range > 0 else 0
         
-        # --- SISTEMA DE PUNTUACIÓN (GURU SCORE) ---
+        # --- GURU SCORE (Algoritmo de Puntuación) ---
         score = 0
         
-        # 1. Supply Shock (Escasez)
+        # A. Supply Shock
         if float_shares and float_shares < 10_000_000: score += 25
         elif float_shares and float_shares < 20_000_000: score += 15
             
-        # 2. Volume Blast (Demanda Extrema)
+        # B. Volume Blast
         if float_shares and current_volume > float_shares: score += 25 
             
-        # 3. RVOL (Momentum)
+        # C. RVOL
         rvol = current_volume / avg_volume if avg_volume > 0 else 0
         if rvol > 5.0: score += 20
         elif rvol > 3.0: score += 10
         
-        # 4. Estructura de Tendencia
+        # D. Tendencia
         if price > sma20 and price > sma50: score += 10
         if price > sma200: score += 5
         
-        # 5. Cierre Fuerte (Para Swing)
+        # E. Price Action
         if close_pos > 0.75: score += 15
             
         return {
@@ -146,7 +125,7 @@ def get_guru_analysis(ticker):
             "RSI": rsi,
             "Cierre %": close_pos * 100,
             "ATR": atr,
-            "Stop Loss": max(price - (2.5 * atr), 0.01) # Stop técnico amplio
+            "Stop Loss": max(price - (2.5 * atr), 0.01)
         }
 
     except:
@@ -154,56 +133,82 @@ def get_guru_analysis(ticker):
 
 # --- SIDEBAR (PANEL LATERAL) ---
 st.sidebar.title("🦈 Filtros Guru")
-st.sidebar.markdown("**Configuración de Escáner**")
 
-min_price = st.sidebar.number_input("Precio Mín ($)", value=0.5)
-max_price = st.sidebar.number_input("Precio Máx ($)", value=25.0)
-min_score = st.sidebar.slider("Score Calidad Mínimo", 0, 100, 60, help="Menos de 60 suele ser ruido.")
+# 1. INPUT MANUAL DE TICKERS
+st.sidebar.markdown("### ✍️ Añadir Mis Tickers")
+manual_input = st.sidebar.text_area(
+    "Pégalos aquí (separados por coma o espacio):", 
+    placeholder="Ej: TSLA, AAPL, AMC, GME"
+)
 
 st.sidebar.markdown("---")
-st.sidebar.info("💡 **Semáforo:**\n\n🟢 **Verde:** Compra Fuerte\n🟣 **Texto Morado:** Float < 10M (Explosivo)")
+st.sidebar.markdown("**Configuración de Escáner**")
 
-# --- ESTILOS DE COLOR (FUNCIONES PANDAS) ---
+# Filtros
+min_price = st.sidebar.number_input("Precio Mín ($)", value=0.5)
+max_price = st.sidebar.number_input("Precio Máx ($)", value=50.0) # Subido a 50 por defecto
+min_score = st.sidebar.slider("Score Calidad Mínimo", 0, 100, 50)
+
+st.sidebar.info("💡 **Nota:** Tus tickers manuales también deben cumplir los filtros de precio para aparecer.")
+
+# --- ESTILOS DE COLOR ---
 def highlight_score(val):
-    if val >= 80: return 'background-color: #00ff00; color: black; font-weight: bold' # Verde Fósforo
-    elif val >= 60: return 'background-color: #ffff00; color: black' # Amarillo
-    return 'background-color: #ffcccc; color: black' # Rojo claro
+    if val >= 80: return 'background-color: #00ff00; color: black; font-weight: bold' 
+    elif val >= 60: return 'background-color: #ffff00; color: black'
+    return 'background-color: #ffcccc; color: black'
 
 def highlight_float(val):
-    if val < 5: return 'color: #800080; font-weight: bold' # Morado oscuro
-    if val < 15: return 'color: #0000ff; font-weight: bold' # Azul fuerte
+    if val < 5: return 'color: #800080; font-weight: bold'
+    if val < 15: return 'color: #0000ff; font-weight: bold'
     return ''
 
 def highlight_rvol(val):
-    if val > 5: return 'color: #006400; font-weight: bold' # Verde oscuro
+    if val > 5: return 'color: #006400; font-weight: bold'
     return ''
 
 # --- INTERFAZ PRINCIPAL ---
-st.title("🚦 Supply Shock Scanner")
-st.write("Detectando desequilibrios de Oferta y Demanda en tiempo real.")
+st.title("🚦 Supply Shock Scanner + Manual Watchlist")
 
 if st.button("🔎 EJECUTAR ANÁLISIS", type="primary"):
     
-    with st.spinner("Bypassing Yahoo Security & Analizando Floats..."):
-        candidates = get_raw_candidates()
+    with st.spinner("Conectando con mercados y fusionando listas..."):
         
-        # Progreso
-        progress_bar = st.progress(0)
+        # 1. Obtener candidatos automáticos
+        market_candidates = get_raw_candidates()
+        
+        # 2. Procesar candidatos manuales
+        manual_candidates = []
+        if manual_input:
+            # Limpieza: quitar comas, convertir a mayúsculas y quitar espacios
+            raw_list = manual_input.replace(',', ' ').split()
+            manual_candidates = [x.strip().upper() for x in raw_list if x.strip()]
+        
+        # 3. Fusión y limpieza de duplicados
+        all_tickers = list(set(market_candidates + manual_candidates))
+        
         status_text = st.empty()
-        
+        progress_bar = st.progress(0)
         valid_data = []
         
-        for i, ticker in enumerate(candidates):
-            progress_bar.progress((i + 1) / len(candidates))
-            status_text.text(f"Analizando estructura de: {ticker}")
+        # 4. Bucle de análisis
+        for i, ticker in enumerate(all_tickers):
+            progress_bar.progress((i + 1) / len(all_tickers))
+            status_text.text(f"Analizando: {ticker}")
             
             data = get_guru_analysis(ticker)
             
             if data:
-                # FILTROS USUARIO
+                # APLICAR FILTROS
                 if min_price <= data['Precio'] <= max_price:
                     if data['Score'] >= min_score:
-                        # Calcular Riesgo Visual
+                        
+                        # Marca visual si es manual
+                        if ticker in manual_candidates:
+                            data['Origen'] = "👤 Manual"
+                        else:
+                            data['Origen'] = "🤖 Auto"
+                            
+                        # Riesgo
                         riesgo = ((data['Precio'] - data['Stop Loss']) / data['Precio']) * 100
                         data['Riesgo %'] = riesgo
                         valid_data.append(data)
@@ -212,11 +217,15 @@ if st.button("🔎 EJECUTAR ANÁLISIS", type="primary"):
         status_text.empty()
         
         if valid_data:
+            # Ordenar: Primero por Score
             df = pd.DataFrame(valid_data).sort_values(by="Score", ascending=False)
             
-            st.success(f"✅ Se encontraron {len(df)} oportunidades calificadas.")
+            # Reordenar columnas para poner Origen al principio
+            cols = ['Ticker', 'Origen', 'Score', 'Precio', 'Float (M)', 'RVOL', 'RSI', 'Cierre %', 'Riesgo %', 'Stop Loss']
+            df = df[cols]
             
-            # MOSTRAR TABLA COLOREADA
+            st.success(f"✅ Análisis completado: {len(df)} acciones encontradas.")
+            
             st.dataframe(
                 df.style
                 .applymap(highlight_score, subset=['Score'])
@@ -232,16 +241,7 @@ if st.button("🔎 EJECUTAR ANÁLISIS", type="primary"):
                     "Riesgo %": "{:.1f}%"
                 }),
                 use_container_width=True,
-                height=600
-            )
-            
-            # BOTÓN DESCARGA
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "📥 Descargar CSV para Excel",
-                csv,
-                f"guru_scan_{datetime.now().strftime('%H%M')}.csv",
-                "text/csv"
+                height=700
             )
         else:
-            st.warning("📉 Ninguna acción superó tus filtros estrictos. El mercado hoy está débil o demasiado caro.")
+            st.warning("📉 Ninguna acción (ni automática ni manual) pasó tus filtros.")
