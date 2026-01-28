@@ -4,6 +4,7 @@ import pandas as pd
 import ta
 import time
 import requests
+import json
 from datetime import datetime
 
 # --- CONFIGURACIÓN VISUAL ---
