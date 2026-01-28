@@ -22,30 +22,57 @@ if 'watchlist' not in st.session_state:
 
 # --- MOTOR DE DATOS (CON BYPASS ANTI-BOT) ---
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300) # Refrescar cada 5 minutos
 def get_raw_candidates():
-    """Obtiene tickers simulando ser un navegador real para evitar bloqueo 403"""
-    try:
-        url = "https://finance.yahoo.com/gainers"
-        
-        # DISFRAZ: Headers de Chrome
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        
-        response = requests.get(url, headers=headers)
-        
-        # Si falla la petición HTTP
-        if response.status_code != 200:
-            st.warning(f"Yahoo respondió con código {response.status_code}. Usando lista de emergencia.")
-            return ["MULN", "GME", "AMC", "MARA", "RIOT", "SOFI", "PLTR", "NVDA", "AMD", "TSLA"]
+    """
+    Obtiene los Top Gainers del día conectando directamente a la API de Yahoo.
+    Esto evita el bloqueo de scraping web y trae hasta 100 resultados frescos.
+    """
+    candidates = []
+    
+    # Lista de endpoints de la API de Yahoo (Gainers y Activas)
+    endpoints = [
+        "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved/day_gainers?count=100&scrIds=day_gainers",
+        "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved/most_actives?count=50&scrIds=most_actives"
+    ]
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Origin': 'https://finance.yahoo.com',
+        'Referer': 'https://finance.yahoo.com/screener/predefined/day_gainers'
+    }
+
+    status_container = st.empty()
+    
+    for url in endpoints:
+        try:
+            # Petición directa a la API JSON
+            response = requests.get(url, headers=headers, timeout=10)
+            data = response.json()
             
-        tables = pd.read_html(response.text)
-        return tables[0]['Symbol'].tolist()
+            # Navegar por el JSON de Yahoo para encontrar los símbolos
+            if 'finance' in data and 'result' in data['finance']:
+                quotes = data['finance']['result'][0].get('quotes', [])
+                for quote in quotes:
+                    symbol = quote.get('symbol')
+                    # Filtramos cosas raras que no sean acciones
+                    if symbol and symbol.isalpha(): 
+                        candidates.append(symbol)
+                        
+        except Exception as e:
+            print(f"Error conectando a API Yahoo: {e}")
+            continue
+
+    # Eliminamos duplicados
+    candidates = list(set(candidates))
+    
+    if not candidates:
+        st.error("⚠️ No se pudo conectar con el mercado en tiempo real. Revisa tu conexión.")
+        # Solo como último recurso absoluto devolvemos una lista vacía para que no analice basura
+        return []
         
-    except Exception as e:
-        st.error(f"Error de conexión: {e}. Usando lista de respaldo.")
-        return ["MULN", "GME", "AMC", "MARA", "RIOT", "SOFI", "PLTR", "NVDA", "AMD", "TSLA"]
+    return candidates
 
 def get_guru_analysis(ticker):
     """Análisis Técnico + Fundamental (Float)"""
