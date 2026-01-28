@@ -5,6 +5,7 @@ import ta
 import requests
 import json
 from datetime import datetime
+import time
 
 # --- CONFIGURACIÓN VISUAL ---
 st.set_page_config(page_title="Sniper Control Center", layout="wide", page_icon="🎛️")
@@ -14,7 +15,7 @@ st.markdown("""
     .stDataFrame { font-size: 1.1rem; }
     div[data-testid="stMetricValue"] { font-size: 1.8rem; }
     .stButton button { width: 100%; border-radius: 8px; font-weight: bold; margin-bottom: 5px; }
-    /* Diferenciar botones visualmente */
+    /* Estilos de botones */
     div[data-testid="column"]:nth-of-type(2) button:nth-of-type(1) { border: 2px solid #ff4b4b; } /* Hot Stocks */
     div[data-testid="column"]:nth-of-type(2) button:nth-of-type(2) { border: 2px solid #ffd700; } /* Penny Stocks */
     </style>
@@ -27,23 +28,65 @@ if 'last_update' not in st.session_state:
     st.session_state.last_update = None
 if 'list_type' not in st.session_state:
     st.session_state.list_type = "Ninguna"
+if 'data_source' not in st.session_state:
+    st.session_state.data_source = ""
 
-# --- MOTOR DE DATOS ---
+# --- MOTOR DE DATOS (MÚLTIPLES FUENTES) ---
 
-def get_market_data(only_pennies=False):
+def get_backup_data(only_pennies=False):
     """
-    Importa datos de Yahoo. 
-    Si only_pennies=True, descarta todo lo que valga más de $10 y busca en Small Caps.
+    PLAN B: Scrapea StockAnalysis.com si Yahoo falla.
+    Es más robusto y tiene listas dedicadas.
     """
     candidates = []
     
-    # Endpoints base
+    # URLs de StockAnalysis (Fuente Respaldo)
+    if only_pennies:
+        urls = [
+            "https://stockanalysis.com/markets/gainers/penny-stocks/",
+            "https://stockanalysis.com/markets/active/penny-stocks/"
+        ]
+    else:
+        urls = [
+            "https://stockanalysis.com/markets/gainers/",
+            "https://stockanalysis.com/markets/active/"
+        ]
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+
+    for url in urls:
+        try:
+            # Usamos requests para descargar el HTML simulando ser un navegador real
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                # Pandas lee las tablas HTML automáticamente
+                dfs = pd.read_html(r.text)
+                if dfs:
+                    df = dfs[0] # La primera tabla suele ser la buena
+                    # Buscamos la columna de símbolos (Symbol)
+                    if 'Symbol' in df.columns:
+                        symbols = df['Symbol'].tolist()
+                        candidates.extend(symbols)
+        except Exception as e:
+            print(f"Error backup {url}: {e}")
+            continue
+            
+    return list(set(candidates))
+
+def get_market_data(only_pennies=False):
+    """
+    Lógica inteligente: Intenta Yahoo -> Si falla, usa Respaldo.
+    """
+    candidates = []
+    source_used = "Yahoo API"
+    
+    # --- INTENTO 1: YAHOO ---
     endpoints = [
         "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved/day_gainers?count=100&scrIds=day_gainers",
         "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved/most_actives?count=50&scrIds=most_actives"
     ]
-    
-    # Si buscamos Pennies, añadimos listas de Small Caps y Growth agresivo
     if only_pennies:
         endpoints.append("https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved/small_cap_gainers?count=100&scrIds=small_cap_gainers")
 
@@ -53,32 +96,36 @@ def get_market_data(only_pennies=False):
     }
 
     progress = st.progress(0)
-    for i, url in enumerate(endpoints):
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            data = response.json()
-            if 'finance' in data and 'result' in data['finance']:
-                quotes = data['finance']['result'][0].get('quotes', [])
-                for quote in quotes:
-                    symbol = quote.get('symbol')
-                    price = quote.get('regularMarketPrice', 999) # Precio aproximado del JSON
-                    
-                    if symbol and symbol.isalpha():
-                        # FILTRO IMPORTACIÓN:
-                        if only_pennies:
-                            # Solo guardamos si vale menos de 15 USD (margen de seguridad)
-                            if price < 15: 
-                                candidates.append(symbol)
-                        else:
-                            # Guardamos todo
-                            candidates.append(symbol)
-                            
-        except:
-            pass
-        progress.progress((i + 1) / len(endpoints))
     
+    # Intentamos Yahoo
+    try:
+        for i, url in enumerate(endpoints):
+            r = requests.get(url, headers=headers, timeout=5)
+            data = r.json()
+            quotes = data['finance']['result'][0].get('quotes', [])
+            for quote in quotes:
+                sym = quote.get('symbol')
+                price = quote.get('regularMarketPrice', 0)
+                if sym and sym.isalpha():
+                    if only_pennies and price > 20: continue # Filtro extra seguridad
+                    candidates.append(sym)
+            progress.progress((i + 1) / (len(endpoints) * 2)) # Barra al 50%
+    except:
+        pass
+
+    # --- INTENTO 2: RESPALDO (Si Yahoo dio 0 resultados) ---
+    if len(candidates) == 0:
+        source_used = "StockAnalysis (Backup)"
+        st.toast("⚠️ Yahoo bloqueado. Activando Plan B (StockAnalysis)...", icon="🔄")
+        time.sleep(1) # Pequeña pausa
+        
+        backup_candidates = get_backup_data(only_pennies)
+        candidates.extend(backup_candidates)
+        
+    progress.progress(1.0)
     progress.empty()
-    return list(set(candidates))
+    
+    return list(set(candidates)), source_used
 
 def get_guru_analysis(ticker):
     """Analiza una sola acción"""
@@ -169,7 +216,7 @@ manual_txt = st.sidebar.text_area("Pega tus acciones aquí:", placeholder="TSLA 
 st.sidebar.markdown("---")
 st.sidebar.header("2. ⚙️ Filtros Finales")
 min_price = st.sidebar.number_input("Min Precio", 0.1)
-max_price = st.sidebar.number_input("Max Precio", 50.0, help="Este filtro se aplica al final, incluso en la lista de Pennies.")
+max_price = st.sidebar.number_input("Max Precio", 50.0)
 min_score = st.sidebar.slider("Min Score", 0, 100, 50)
 
 # PANEL DE CONTROL (3 COLUMNAS)
@@ -190,36 +237,44 @@ with c1:
             else: st.warning("Nada pasó el filtro.")
         else: st.error("Lista vacía.")
 
-# --- COLUMNA 2: IMPORTAR (2 OPCIONES) ---
+# --- COLUMNA 2: IMPORTAR (FUENTE INTELIGENTE) ---
 with c2:
     st.subheader("2. Importar Mercado")
     
     # Botón A: Mercado General
     if st.button("🔥 Importar TODO (Hot Stocks)"):
-        with st.spinner("Descargando mercado general..."):
-            fetched = get_market_data(only_pennies=False)
+        with st.spinner("Buscando en Yahoo + Backups..."):
+            fetched, source = get_market_data(only_pennies=False)
             st.session_state.auto_candidates = fetched
             st.session_state.last_update = datetime.now().strftime("%H:%M:%S")
             st.session_state.list_type = "Hot Stocks Global"
-        st.success(f"📥 {len(fetched)} Acciones Cargadas")
+            st.session_state.data_source = source
+        if len(fetched) > 0:
+            st.success(f"📥 {len(fetched)} Acciones (Fuente: {source})")
+        else:
+            st.error("❌ Fallaron todas las fuentes de datos.")
     
     # Botón B: Solo Pennies
-    if st.button("🪙 Importar SOLO Pennies (<$15)"):
-        with st.spinner("Filtrando acciones baratas..."):
-            fetched = get_market_data(only_pennies=True)
+    if st.button("🪙 Importar SOLO Pennies"):
+        with st.spinner("Buscando Pennies en Yahoo + Backups..."):
+            fetched, source = get_market_data(only_pennies=True)
             st.session_state.auto_candidates = fetched
             st.session_state.last_update = datetime.now().strftime("%H:%M:%S")
             st.session_state.list_type = "Pennies (<$15)"
-        st.success(f"📥 {len(fetched)} Pennies Cargadas")
+            st.session_state.data_source = source
+        if len(fetched) > 0:
+            st.success(f"📥 {len(fetched)} Pennies (Fuente: {source})")
+        else:
+            st.error("❌ Fallaron todas las fuentes de datos.")
 
 # --- COLUMNA 3: ANALIZAR IMPORTADAS ---
 with c3:
     st.subheader("3. Ejecutar Sniper")
     can_analyze = len(st.session_state.auto_candidates) > 0
     
-    # Mostrar qué lista está cargada
+    # Mostrar info detallada
     if can_analyze:
-        st.info(f"Lista: **{st.session_state.list_type}**\nCargada: {st.session_state.last_update}")
+        st.info(f"**Lista:** {st.session_state.list_type}\n**Fuente:** {st.session_state.data_source}\n**Hora:** {st.session_state.last_update}")
     else:
         st.warning("⚠️ Memoria vacía. Importa primero.")
 
